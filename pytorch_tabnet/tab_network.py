@@ -198,7 +198,7 @@ class TabNet(torch.nn.Module):
                  n_steps=3, gamma=1.3, cat_idxs=[], cat_dims=[], cat_emb_dim=1,
                  n_independent=2, n_shared=2, epsilon=1e-15,
                  virtual_batch_size=128, momentum=0.02, device_name='auto',
-                 mask_type="sparsemax"):
+                 mask_type="sparsemax", self_supervised=False):
         """
         Defines TabNet network
 
@@ -254,11 +254,14 @@ class TabNet(torch.nn.Module):
         self.n_independent = n_independent
         self.n_shared = n_shared
         self.mask_type = mask_type
+        self.self_supervised = self_supervised
 
         if self.n_steps <= 0:
             raise ValueError("n_steps should be a positive integer.")
         if self.n_independent == 0 and self.n_shared == 0:
             raise ValueError("n_shared and n_independant can't be both zero.")
+        if isinstance(self.output_dim, list) and self.self_supervised:
+            raise ValueError("output_dim can only be scalars and be equal to input_dim when self_supervised is set to be true")
 
         self.virtual_batch_size = virtual_batch_size
         self.embedder = EmbeddingGenerator(input_dim, cat_dims, cat_idxs, cat_emb_dim)
@@ -266,6 +269,7 @@ class TabNet(torch.nn.Module):
         self.tabnet = TabNetNoEmbeddings(self.post_embed_dim, output_dim, n_d, n_a, n_steps,
                                          gamma, n_independent, n_shared, epsilon,
                                          virtual_batch_size, momentum, mask_type)
+        self.decoder = Decoder(output_dim, self.post_embed_dim, n_d,  n_steps, n_independent, n_shared, virtual_batch_size, momentum)
 
         # Defining device
         if device_name == 'auto':
@@ -278,12 +282,95 @@ class TabNet(torch.nn.Module):
 
     def forward(self, x):
         x = self.embedder(x)
-        return self.tabnet(x)
+        encoded= self.tabnet(x)
+        output = encoded[0] if not self.self_supervised else self.decoder(encoded[0])
+        return output, encoded[1]
 
     def forward_masks(self, x):
         x = self.embedder(x)
         return self.tabnet.forward_masks(x)
 
+
+class Decoder(torch.nn.Module):
+    def __init__(self, input_dim, output_dim, f_d=16,
+                 n_steps=3, n_independent=2, n_shared=2,
+                 virtual_batch_size=128, momentum=0.02):
+        """
+        Defines main part of the TabNet network without the embedding layers.
+
+        Parameters
+        ----------
+        input_dim : int
+            Number of features
+        output_dim : int or list of int for multi task classification
+            Dimension of network output
+            examples : one for regression, 2 for binary classification etc...
+        n_d : int
+            Dimension of the prediction  layer (usually between 4 and 64)
+        n_a : int
+            Dimension of the attention  layer (usually between 4 and 64)
+        n_steps : int
+            Number of sucessive steps in the newtork (usually betwenn 3 and 10)
+        gamma : float
+            Float above 1, scaling factor for attention updates (usually betwenn 1.0 to 2.0)
+        n_independent : int
+            Number of independent GLU layer in each GLU block (default 2)
+        n_shared : int
+            Number of independent GLU layer in each GLU block (default 2)
+        epsilon : float
+            Avoid log(0), this should be kept very low
+        virtual_batch_size : int
+            Batch size for Ghost Batch Normalization
+        momentum : float
+            Float value between 0 and 1 which will be used for momentum in all batch norm
+        mask_type : str
+            Either "sparsemax" or "entmax" : this is the masking function to use
+        """
+        super(Decoder, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.is_multi_task = isinstance(output_dim, list)
+        self.f_d = f_d
+        self.n_steps = n_steps
+        self.n_independent = n_independent
+        self.n_shared = n_shared
+        self.virtual_batch_size = virtual_batch_size
+        self.initial_bn = BatchNorm1d(self.input_dim, momentum=0.01)
+
+        if self.n_shared > 0:
+            shared_feat_transform = torch.nn.ModuleList()
+            for i in range(self.n_shared):
+                if i == 0:
+                    shared_feat_transform.append(Linear(self.input_dim,
+                                                        2 * self.f_d,
+                                                        bias=False))
+                else:
+                    shared_feat_transform.append(Linear(self.f_d, 2 * self.f_d, bias=False))
+
+        else:
+            shared_feat_transform = None
+
+        self.feat_transformers = torch.nn.ModuleList()
+
+        for step in range(n_steps):
+            transformer = FeatTransformer(self.input_dim, self.f_d, shared_feat_transform,
+                                          n_glu_independent=self.n_independent,
+                                          virtual_batch_size=self.virtual_batch_size,
+                                          momentum=momentum, self_supervised=True, f_d=self.output_dim)
+            self.feat_transformers.append(transformer)
+
+    def forward(self, x):
+        res = 0
+
+        for step in range(self.n_steps):
+
+            res = torch.add(res, self.feat_transformers[step](x))
+
+        out = self.fc(res)
+        return out
+
+    def forward_masks(self, x):
+        pass
 
 class AttentiveTransformer(torch.nn.Module):
     def __init__(self, input_dim, output_dim,
@@ -332,7 +419,7 @@ class AttentiveTransformer(torch.nn.Module):
 
 class FeatTransformer(torch.nn.Module):
     def __init__(self, input_dim, output_dim, shared_layers, n_glu_independent,
-                 virtual_batch_size=128, momentum=0.02):
+                 virtual_batch_size=128, momentum=0.02, self_supervised=False, f_d=16):
         super(FeatTransformer, self).__init__()
         """
         Initialize a feature transformer.
@@ -381,10 +468,14 @@ class FeatTransformer(torch.nn.Module):
                                        first=is_first,
                                        **params)
 
+        if self.self_supervised:
+            self.fc = Linear(spec_input_dim, f_d, bias=False)
+            initialize_non_glu(spec_input_dim, f_d)
+
     def forward(self, x):
         x = self.shared(x)
         x = self.specifics(x)
-        return x
+        return x if not self.self_supervised else self.fc(x)
 
 
 class GLU_Block(torch.nn.Module):
